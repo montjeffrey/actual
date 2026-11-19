@@ -10,6 +10,10 @@ name: Actual sync-server image checks (9338)
 on:
   push:
     branches: [lab-9338]
+    # The NFS probe has a workflow of its own.
+    paths-ignore:
+      - .github/workflows/actual-9338-nfs.yml
+      - scripts/actual-9338-nfs-probe.sh
 
 permissions:
   contents: read

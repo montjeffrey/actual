@@ -1,0 +1,87 @@
+# The NFS root-squash cases of the review of actualbudget/actual#9338 on a
+# GitHub-hosted runner, against two NFS servers: the user-space server the
+# other scripts use (a container), and the runner's own kernel NFS server.
+# With probes that show which call fails for root and for the run user.
+#
+# It only reads actualbudget/actual; it pushes nothing and uses no secrets.
+name: Actual sync-server NFS probe (9338)
+
+on:
+  push:
+    branches: [lab-9338]
+    paths:
+      - .github/workflows/actual-9338-nfs.yml
+      - scripts/actual-9338-nfs-probe.sh
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      REF: e9e78546cd25f6c9db157d69e7203502ee52d37e
+      PR: actual-pr9338:head
+      V2: actual-pr9338:v2
+      NFS: f9338-nfs-rootsquash:local
+      EXPORT: /srv/f9338export
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: actualbudget/actual
+          ref: ${{ env.REF }}
+          path: actual
+          persist-credentials: false
+
+      - name: Build the images
+        working-directory: actual
+        env:
+          ENTRY: packages/sync-server/docker/docker-entrypoint.sh
+        run: |
+          docker build -q -f sync-server.Dockerfile -t "$PR" .
+          git apply ../patches/2026-11-18-actual-9338-entrypoint-v2.patch
+          docker build -q -f sync-server.Dockerfile -t "$V2" .
+          git checkout -- "$ENTRY"
+          docker build -q -t "$NFS" ../scripts/actual-9338-images/nfs-rootsquash
+
+      - name: Probe the user-space NFS server
+        run: |
+          mkdir -p logs
+          bash scripts/actual-9338-nfs-probe.sh ganesha > logs/nfs-probe-ganesha.log 2>&1 || true
+          cat logs/nfs-probe-ganesha.log
+
+      # Does not stop the job: the kernel of the runner may come without nfsd.
+      - name: Export a folder from the runner's kernel NFS server
+        id: export
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nfs-kernel-server
+          sudo mkdir -p "$EXPORT"
+          echo "$EXPORT 127.0.0.1(rw,sync,root_squash,no_subtree_check)" | sudo tee /etc/exports.d/f9338.exports
+          sudo systemctl restart nfs-server
+          sudo exportfs -ra
+          sudo exportfs -v
+          lsmod | grep -E '^nfsd' || true
+
+      - name: Probe the kernel NFS server
+        if: steps.export.outcome == 'success'
+        run: |
+          bash scripts/actual-9338-nfs-probe.sh host 127.0.0.1 "$EXPORT" > logs/nfs-probe-kernel.log 2>&1 || true
+          cat logs/nfs-probe-kernel.log
+
+      - name: Kernel messages about NFS
+        if: always()
+        run: sudo dmesg | grep -i -E 'nfs|rpc' | tail -40 | tee logs/dmesg-nfs.log || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: logs-nfs
+          path: logs/
+          retention-days: 30
