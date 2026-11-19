@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq nfs-kernel-server
-          sudo mkdir -p "$EXPORT"
+          sudo mkdir -p "$EXPORT" /etc/exports.d
           echo "$EXPORT 127.0.0.1(rw,sync,root_squash,no_subtree_check)" | sudo tee /etc/exports.d/f9338.exports
           sudo systemctl restart nfs-server
           sudo exportfs -ra
