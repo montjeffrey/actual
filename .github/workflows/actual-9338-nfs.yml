@@ -18,9 +18,16 @@ permissions:
 
 jobs:
   probe:
+    name: storage ${{ matrix.storage }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        storage: [default, vfs]
     env:
+      # One manifest per image, so docker save and docker load carry it as it is.
+      BUILDX_NO_DEFAULT_ATTESTATIONS: 1
       REF: e9e78546cd25f6c9db157d69e7203502ee52d37e
       PR: actual-pr9338:head
       V2: actual-pr9338:v2
@@ -48,6 +55,25 @@ jobs:
           docker build -q -f sync-server.Dockerfile -t "$V2" .
           git checkout -- "$ENTRY"
           docker build -q -t "$NFS" ../scripts/actual-9338-images/nfs-rootsquash
+
+      - name: Move the images to a vfs engine
+        if: matrix.storage == 'vfs'
+        run: |
+          tar="$RUNNER_TEMP/images.tar"
+          docker save -o "$tar" "$PR" "$V2" "$NFS"
+          docker system prune -af --volumes > /dev/null
+          docker builder prune -af > /dev/null
+
+          cfg=/etc/docker/daemon.json
+          sudo test -f "$cfg" || echo '{}' | sudo tee "$cfg" > /dev/null
+          sudo jq '. + {"storage-driver": "vfs"} | .features = ((.features // {}) + {"containerd-snapshotter": false})' "$cfg" |
+            sudo tee "$cfg.new"
+          sudo mv "$cfg.new" "$cfg"
+          sudo systemctl restart docker || { sudo journalctl -u docker -n 60 --no-pager; exit 1; }
+          test "$(docker info --format '{{.Driver}}')" = vfs
+
+          docker load -q -i "$tar"
+          rm "$tar"
 
       - name: Probe the user-space NFS server
         run: |
@@ -82,6 +108,6 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: logs-nfs
+          name: logs-nfs-${{ matrix.storage }}
           path: logs/
           retention-days: 30
