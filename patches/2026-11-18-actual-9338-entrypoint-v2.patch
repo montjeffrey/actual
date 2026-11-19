@@ -1,0 +1,95 @@
+diff --git a/packages/sync-server/docker/docker-entrypoint.sh b/packages/sync-server/docker/docker-entrypoint.sh
+index 08113c475..98cf1d815 100755
+--- a/packages/sync-server/docker/docker-entrypoint.sh
++++ b/packages/sync-server/docker/docker-entrypoint.sh
+@@ -16,8 +16,15 @@ set -e
+ #   unsafe  a data folder or file setting that can't be used, and why
+ #   port    the port
+ # A config the server can't parse is left for the server to report.
++uid=$(id -u)
++# The user the server will run as, when started as root.
++if [ "$uid" = 0 ]; then
++  run_uid="${PUID:-$(id -u actual)}"
++  run_gid="${PGID:-$(id -g actual)}"
++fi
++
+ # shellcheck disable=SC2016 # JavaScript, not shell expansions
+-settings=$(node -e '
++settings=$(RUN_UID="$run_uid" RUN_GID="$run_gid" node -e '
+   const fs = require("fs");
+   const path = require("path");
+   const { env } = process;
+@@ -31,17 +38,31 @@ settings=$(node -e '
+       configPath = path.join(dataDir, "config.json");
+     }
+   }
++  // Root can be locked out of a share the run user owns (e.g. root squash), so
++  // only the run user can tell what is in there.
++  const isRootLockedOut = error => error.code === "EACCES" && process.getuid() === 0;
++  const readAsRunUser = file =>
++    require("child_process").execFileSync(
++      "setpriv",
++      [`--reuid=${env.RUN_UID}`, `--regid=${env.RUN_GID}`, "--clear-groups", "cat", "--", file],
++      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
++    );
++
+   let config = {};
+   try {
+-    config = JSON.parse(fs.readFileSync(configPath, "utf8")) ?? {};
++    let text;
++    try {
++      text = fs.readFileSync(configPath, "utf8");
++    } catch (error) {
++      if (!isRootLockedOut(error)) throw error;
++      text = readAsRunUser(configPath);
++    }
++    config = JSON.parse(text) ?? {};
+   } catch {}
+ 
+   // The environment beats config.json, even when it is set to an empty value.
+   const setting = (name, value) => (name in env ? env[name] : value);
+   const hasBadCharacter = value => /[\n\0]/.test(value);
+-  // Root can be locked out of a share the run user owns (e.g. root squash), so
+-  // only the run user can tell what is in there.
+-  const isRootLockedOut = error => error.code === "EACCES" && process.getuid() === 0;
+ 
+   function addDir(label, value) {
+     if (typeof value !== "string") return;
+@@ -59,6 +80,24 @@ settings=$(node -e '
+     if (process.getuid() === 0 && !path.relative(real, "/app").startsWith("..")) {
+       return unsafe("which is or contains the server app folder (/app)");
+     }
++    // The same goes for a folder in /app that came with the image, such as
++    // node_modules: root owns it and it is not in a mount of its own.
++    if (process.getuid() === 0 && !path.relative("/app", real).startsWith("..")) {
++      // A mount point is the fifth field, with spaces and the like in octal.
++      let mounts = [];
++      try {
++        mounts = fs
++          .readFileSync("/proc/self/mountinfo", "utf8")
++          .split("\n")
++          .map(line => (line.split(" ")[4] ?? "").replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(parseInt(octal, 8))));
++      } catch {}
++      const mounted = mounts.some(point => point.startsWith("/app/") && !path.relative(point, real).startsWith(".."));
++      try {
++        if (!mounted && fs.statSync(real).uid === 0) {
++          return unsafe("which is part of the server app in /app");
++        }
++      } catch {}
++    }
+     lines.add(`dir ${real}`);
+   }
+ 
+@@ -113,12 +152,9 @@ data_dirs=$(list dir)
+ read_files=$(list file)
+ unsafe=$(list unsafe)
+ port=$(list port)
+-uid=$(id -u)
+ 
+ # Runs a command as the user the server will run as.
+ if [ "$uid" = 0 ]; then
+-  run_uid="${PUID:-$(id -u actual)}"
+-  run_gid="${PGID:-$(id -g actual)}"
+   run_as() {
+     setpriv --reuid="$run_uid" --regid="$run_gid" --clear-groups "$@"
+   }

@@ -1,0 +1,201 @@
+# Runs the test scripts of the review of actualbudget/actual#9338 on a
+# GitHub-hosted Linux runner, where there is root: once on the runner's own
+# Docker storage driver, once with the engine switched to vfs.
+#
+# Lives on a branch that holds only this file, the folder scripts/ and the
+# folder patches/, and runs on a push to that branch. It only reads
+# actualbudget/actual; it pushes nothing and uses no secrets.
+name: Actual sync-server image checks (9338)
+
+on:
+  push:
+    branches: [lab-9338]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-9338-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: storage ${{ matrix.storage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        storage: [default, vfs]
+    env:
+      REF: e9e78546cd25f6c9db157d69e7203502ee52d37e
+      STORAGE: ${{ matrix.storage }}
+      # One manifest per image, so docker save and docker load carry it as it is.
+      BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+      OLD: actualbudget/actual-server:26.10.0
+      NFS: f9338-nfs-rootsquash:local
+      TOOLS: lab-tools:local
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: actualbudget/actual
+          ref: ${{ env.REF }}
+          path: actual
+          persist-credentials: false
+
+      # vfs keeps a full copy of the files for every layer and every container.
+      - name: Make room on the disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version-file: actual/.nvmrc
+          package-manager-cache: false
+
+      # The image of the root sync-server.Dockerfile, which builds inside the
+      # image. From the clean checkout, before anything is built outside.
+      - name: Build the sync-server.Dockerfile images
+        working-directory: actual
+        env:
+          ENTRY: packages/sync-server/docker/docker-entrypoint.sh
+        run: |
+          dev() { docker build -q -f sync-server.Dockerfile -t "actual-pr9338:$1" .; }
+          dev head
+          # The check as first suggested in the review.
+          git apply ../patches/2026-11-18-actual-9338-entrypoint.patch
+          dev v1
+          git checkout -- "$ENTRY"
+          # The revised check and the config.json change.
+          git apply ../patches/2026-11-18-actual-9338-entrypoint-v2.patch
+          dev v2
+          git checkout -- "$ENTRY"
+
+      # The two release images, as docker-nightly.yml does it: build outside
+      # the image, then docker build. The translations are not downloaded; they
+      # are no part of what is tested.
+      - name: Build the server
+        working-directory: actual
+        run: |
+          yarn --immutable
+          yarn build:server
+
+      - name: Build the release images
+        working-directory: actual
+        env:
+          ENTRY: packages/sync-server/docker/docker-entrypoint.sh
+        run: |
+          release() {
+            for os in ubuntu alpine; do
+              docker build -q -f "packages/sync-server/docker/$os.Dockerfile" -t "actual-$os:$1" .
+            done
+          }
+          release head
+          git apply ../patches/2026-11-18-actual-9338-entrypoint-v2.patch
+          release patched
+          git checkout -- "$ENTRY"
+
+      - name: Build the helper images
+        run: |
+          docker build -q -t "$NFS" scripts/actual-9338-images/nfs-rootsquash
+          printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*\n' |
+            docker build -q -t "$TOOLS" -
+          docker pull -q "$OLD"
+
+      # The images are built on the runner's own storage driver and loaded into
+      # the vfs engine, as the earlier docker-in-docker run did.
+      - name: Move the images to a vfs engine
+        if: matrix.storage == 'vfs'
+        run: |
+          tar="$RUNNER_TEMP/images.tar"
+          docker save -o "$tar" actual-ubuntu:head actual-alpine:head actual-ubuntu:patched actual-alpine:patched \
+            actual-pr9338:head actual-pr9338:v1 actual-pr9338:v2 "$NFS" "$TOOLS" "$OLD"
+          ls -lh "$tar"
+          docker system prune -af --volumes > /dev/null
+          docker builder prune -af > /dev/null
+
+          cfg=/etc/docker/daemon.json
+          sudo test -f "$cfg" || echo '{}' | sudo tee "$cfg" > /dev/null
+          sudo jq '. + {"storage-driver": "vfs"} | .features = ((.features // {}) + {"containerd-snapshotter": false})' "$cfg" |
+            sudo tee "$cfg.new"
+          sudo mv "$cfg.new" "$cfg"
+          sudo systemctl restart docker || { sudo journalctl -u docker -n 60 --no-pager; exit 1; }
+          test "$(docker info --format '{{.Driver}}')" = vfs
+
+          docker load -q -i "$tar"
+          rm "$tar"
+          df -h /
+
+      - name: Engine and images
+        run: |
+          mkdir -p logs
+          {
+            echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "ref: $REF"
+            echo "runner: $(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r)"
+            echo "docker: $(docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'), storage driver $(docker info --format '{{.Driver}}'), root on $(df --output=fstype "$(docker info --format '{{.DockerRootDir}}')" | tail -1)"
+            for image in actual-ubuntu:head actual-alpine:head actual-ubuntu:patched actual-alpine:patched actual-pr9338:head actual-pr9338:v1 actual-pr9338:v2; do
+              echo "image: $image $(docker image inspect "$image" --format '{{.Id}}')"
+              echo "  entrypoint sha256 $(docker run --rm --entrypoint sha256sum "$image" /usr/local/bin/docker-entrypoint.sh | cut -c1-64)"
+            done
+            for image in "$OLD" "$NFS" "$TOOLS"; do
+              echo "image: $image $(docker image inspect "$image" --format '{{.Id}}')"
+            done
+          } | tee logs/engine.log
+
+      # A failed check does not stop the job: the commit is expected to fail
+      # some. The last line of each run is in the log and in the job summary.
+      - name: Regression script
+        run: |
+          for image in actual-ubuntu:head actual-alpine:head actual-ubuntu:patched actual-alpine:patched; do
+            log="logs/regression-${image//:/-}.log"
+            sh scripts/actual-9338-regression.sh "$image" > "$log" 2>&1 || true
+            echo "$STORAGE, $image: $(tail -1 "$log")" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Volume on the same device as /app, and nested mounts
+        env:
+          PR: actual-pr9338:head
+          V1: actual-pr9338:v1
+          V2: actual-pr9338:v2
+          FLATV2: actual-ubuntu:patched
+          LOCAL: host
+          ENGINES: host
+          SAME_FS_BIND: ${{ matrix.storage == 'vfs' && '/var/lib/docker/f9338sbind' || '' }}
+        run: bash scripts/actual-9338-same-device.sh > logs/same-device.log 2>&1 || true
+
+      - name: The three review findings, with the NFS root-squash cases
+        env:
+          PR: actual-pr9338:head
+          PATCHED: actual-pr9338:v2
+          FLAT: actual-ubuntu:head
+          FLATP: actual-ubuntu:patched
+        run: bash scripts/actual-9338-open-findings.sh > logs/open-findings.log 2>&1 || true
+
+      - name: Open-limits and bind-mount cases
+        run: |
+          for os in ubuntu alpine; do
+            PR="actual-$os:head" V2="actual-$os:patched" bash scripts/actual-9338-open-limits.sh > "logs/open-limits-$os.log" 2>&1 || true
+            PR="actual-$os:head" V2="actual-$os:patched" bash scripts/actual-9338-bind-mounts.sh > "logs/bind-mounts-$os.log" 2>&1 || true
+          done
+
+      - name: What is left
+        if: always()
+        run: |
+          {
+            echo "containers: $(docker ps -a --format '{{.Names}}' | tr '\n' ' ')"
+            echo "volumes: $(docker volume ls -q | tr '\n' ' ')"
+            df -h /
+          } | tee -a logs/engine.log
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: logs-${{ matrix.storage }}
+          path: logs/
+          retention-days: 30
