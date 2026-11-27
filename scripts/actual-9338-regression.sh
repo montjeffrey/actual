@@ -10,12 +10,52 @@
 # and the container runs without DAC_OVERRIDE and DAC_READ_SEARCH, so root gets
 # EACCES on /data/config.json, as it does on a root-squash NFS export.
 #
-# Uses the container f9338r and the volumes f9338rdata and f9338rsrv, and
-# removes them at the end.
+# Each run makes its own container and two volumes, named after a run id
+# (f9338r-<time>-<pid>-<random>) and labelled actual-9338-regression=<run id>.
+# It removes only those, also when it is stopped early, and it refuses to start
+# if a name it would use is already taken. Nothing else on the engine is touched.
+#
+#   START_TIMEOUT  seconds to wait for the server to listen (default 120); a slow
+#                  host needs more. A server still starting when the wait is over
+#                  is reported as "not listening", not as a failed sign-in.
 set -u
 export MSYS_NO_PATHCONV=1 # Git Bash on Windows: leave container paths alone
 
 image=${1:?usage: actual-9338-regression.sh <image>}
+START_TIMEOUT=${START_TIMEOUT:-120}
+case $START_TIMEOUT in '' | *[!0-9]*)
+  echo "START_TIMEOUT must be a number of seconds, got: $START_TIMEOUT" >&2
+  exit 2
+  ;;
+esac
+RUN=f9338r-$(date +%s)-$$-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
+LABEL=actual-9338-regression=$RUN
+CTR=$RUN
+VDATA=$RUN-data
+VSRV=$RUN-srv
+if docker container inspect "$CTR" >/dev/null 2>&1; then
+  echo "a container named $CTR already exists; not touching it" >&2
+  exit 2
+fi
+for name in "$VDATA" "$VSRV"; do
+  if docker volume inspect "$name" >/dev/null 2>&1; then
+    echo "a volume named $name already exists; not touching it" >&2
+    exit 2
+  fi
+done
+
+# Removes what this run made: containers with this run's label (the server and
+# any helper still running), then this run's two volumes, by their exact names.
+remove_own() {
+  ids=$(docker ps -aq --filter "label=$LABEL")
+  # shellcheck disable=SC2086 # one id per word
+  [ -z "$ids" ] || docker container rm -f $ids >/dev/null 2>&1
+  docker volume rm -f "$VDATA" "$VSRV" >/dev/null 2>&1
+}
+trap remove_own EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 fails=0
 checks=0
 LOCKED='--cap-drop DAC_OVERRIDE --cap-drop DAC_READ_SEARCH'
@@ -37,46 +77,58 @@ check() { # <what> <got> <want>
   fi
 }
 
+# Starts the next case on two new, empty volumes of this run's own.
 clean() {
-  docker container rm -f f9338r >/dev/null 2>&1
-  docker volume rm -f f9338rdata f9338rsrv >/dev/null 2>&1
+  remove_own
+  docker volume create --label "$LABEL" "$VDATA" >/dev/null &&
+    docker volume create --label "$LABEL" "$VSRV" >/dev/null || {
+    echo "could not create the volumes $VDATA and $VSRV" >&2
+    exit 2
+  }
 }
 
 # prepare <shell commands>: runs them as root in a helper container that has
 # both volumes mounted, before the server is started.
 prepare() {
-  docker run --rm --entrypoint sh -e CONFIG="$CONFIG" \
-    -v f9338rdata:/data -v f9338rsrv:/srv/actual "$image" -c "$1"
+  docker run --rm --label "$LABEL" --entrypoint sh -e CONFIG="$CONFIG" \
+    -v "$VDATA":/data -v "$VSRV":/srv/actual "$image" -c "$1"
 }
 
 # start <docker run arguments...>: starts the server and waits until it
-# listens or stops.
+# listens or stops, for at most START_TIMEOUT seconds.
+listening=no
 start() {
-  docker container rm -f f9338r >/dev/null 2>&1
-  docker run -d --name f9338r -v f9338rdata:/data -v f9338rsrv:/srv/actual "$@" "$image" >/dev/null
+  docker container rm -f "$CTR" >/dev/null 2>&1
+  docker run -d --name "$CTR" --label "$LABEL" -v "$VDATA":/data -v "$VSRV":/srv/actual "$@" "$image" >/dev/null
+  listening=no
   i=0
-  while [ "$i" -lt 40 ]; do
+  while [ "$i" -lt "$START_TIMEOUT" ]; do
     [ "$(state)" = running ] || break
-    docker logs f9338r 2>&1 | grep -q 'Listening on' && break
+    if docker logs "$CTR" 2>&1 | grep -q 'Listening on'; then
+      listening=yes
+      break
+    fi
     sleep 1
     i=$((i + 1))
   done
   sleep 2
   # A server that stopped: show why.
   if [ "$(state)" != running ]; then
-    docker logs f9338r 2>&1 | grep -m1 'Error' | cut -c1-110 | sed 's/^/  log: /'
+    docker logs "$CTR" 2>&1 | grep -m1 'Error' | cut -c1-110 | sed 's/^/  log: /'
+  elif [ "$listening" = no ]; then
+    echo "  log: still not listening after ${START_TIMEOUT}s (START_TIMEOUT)"
   fi
 }
 
-state() { docker inspect f9338r --format '{{.State.Status}}' 2>/dev/null; }
-exit_code() { docker inspect f9338r --format '{{.State.ExitCode}}' 2>/dev/null; }
-warnings() { docker logs f9338r 2>&1 | grep -c '^Warning' ; }
-first_error() { docker logs f9338r 2>&1 | grep -m1 '^Error' | cut -c1-60; }
+state() { docker inspect "$CTR" --format '{{.State.Status}}' 2>/dev/null; }
+exit_code() { docker inspect "$CTR" --format '{{.State.ExitCode}}' 2>/dev/null; }
+warnings() { docker logs "$CTR" 2>&1 | grep -c '^Warning' ; }
+first_error() { docker logs "$CTR" 2>&1 | grep -m1 '^Error' | cut -c1-60; }
 
 # uid the server process runs as, or "none".
 server_uid() {
   if [ "$(state)" != running ]; then echo none; return; fi
-  docker exec f9338r sh -c 'for p in /proc/[0-9]*; do
+  docker exec "$CTR" sh -c 'for p in /proc/[0-9]*; do
       if [ "$(sed -n "s/^Name:\t//p" "$p/status" 2>/dev/null)" = MainThread ]; then
         sed -n "s/^Uid:\t\([0-9]*\).*/\1/p" "$p/status"
       fi
@@ -85,13 +137,14 @@ server_uid() {
 
 owner() { # <path>
   if [ "$(state)" != running ]; then echo none; return; fi
-  docker exec f9338r stat -c '%u:%g' "$1" 2>/dev/null || echo missing
+  docker exec "$CTR" stat -c '%u:%g' "$1" 2>/dev/null || echo missing
 }
 
 # Sets a password, signs in with it, and prints the HTTP status of the sign-in.
 sign_in() {
   if [ "$(state)" != running ]; then echo none; return; fi
-  docker exec f9338r node -e '
+  if [ "$listening" = no ]; then echo "not listening"; return; fi
+  docker exec "$CTR" node -e '
     const post = path => fetch("http://localhost:5006" + path, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -106,6 +159,7 @@ sign_in() {
 
 echo "image: $image $(docker image inspect "$image" --format '{{.Id}}')"
 echo "entrypoint: $(docker run --rm --entrypoint sha256sum "$image" /usr/local/bin/docker-entrypoint.sh | cut -c1-64)"
+echo "run: $RUN (START_TIMEOUT ${START_TIMEOUT}s)"
 
 case_ 'C1. Started as root, default settings, new volume (control)'
 clean
@@ -200,7 +254,8 @@ check 'state' "$(state)" exited
 check 'exit code' "$(exit_code)" 1
 check 'first error' "$(first_error)" "Error: uid 1000 can't write to /data or something in it."
 
-clean
-left=$(docker ps -a --filter name=f9338r --format '{{.Names}}'; docker volume ls --filter name=f9338r --format '{{.Name}}')
+remove_own
+left=$(docker ps -a --filter "label=$LABEL" --format '{{.Names}}'; docker volume ls --filter "label=$LABEL" --format '{{.Name}}')
+left=$(printf '%s' "$left" | tr '\n' ' ')
 printf '\n%s checks, %s failed%s\n' "$checks" "$fails" "${left:+, left over: $left}"
 [ "$fails" -eq 0 ]
